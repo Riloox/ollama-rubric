@@ -1,26 +1,28 @@
-For: Ollama — `ollama-bench -decision` grades classification choices; `rubric` grades generated prose against a JSONL task file, language constraints, and an optional local LLM judge.
+# ollama-rubric
 
-Zero dependencies outside Python's standard library. Talks to local Ollama over `/api/generate` at temperature 0.
+I built this because `ollama-bench -decision` in Ollama's `cmd/bench` grades fixed multiple-choice answers, whereas most fine-tunes I actually care about generate free-form text. Here, the model has to fix a learner's Spanish sentence if there is an error, explain why in Korean, and leave already-correct sentences alone.
 
-## What it does
+Zero dependencies outside Python's standard library. It talks to local Ollama over `/api/generate` at temperature 0.
 
-`ollama-bench -decision` in Ollama's `cmd/bench` checks multiple-choice classifications. Most local fine-tunes are tested on generation tasks instead: rewrite a learner's Spanish sentence if it has an error, explain why in Korean, and leave already-correct sentences alone.
+The 208-item eval set and fine-tuned models come from my tutor repo: <https://github.com/Riloox/gemma-spanish-tutor-wip>.
 
-`rubric` runs any list of Ollama models against a frozen JSONL task file and outputs:
+## Overview
+
+`rubric` runs a list of local Ollama models against a frozen JSONL task file and outputs:
 
 1. Pass counts with Wilson 95% intervals and p50 latency per model.
 2. Deterministic string checks (`contains_any`, `contains_all`, `not_contains`, `says_correct`, `require_korean`).
-3. Optional local LLM judge (`--judge gemma4:26b`) using structured JSON output (`format` schema), blind to the reference fix by default (`--judge-show-fix` opts in).
+3. An optional local LLM judge (`--judge gemma4:26b`) using structured JSON output (`format` schema), blind to the reference fix by default (`--judge-show-fix` opts in).
 4. Per-item failure diffs and judge-vs-string-check disagreement rows.
-5. Stratified blind sampling and Cohen's kappa (`calibrate --interactive`) so you can verify the judge against 30 human labels before trusting a table.
+5. Stratified blind sampling and Cohen's kappa (`calibrate --interactive`) so you can verify the judge against 30 human labels before trusting a score table.
 
-## Measured: local Spanish tutor (208 items)
+## Measured results (208 items)
 
-Task file: `tasks/test_set_v4.1.jsonl` (104 erroneous Spanish sentences expecting a targeted fix, 104 already-correct sentences expecting confirmation without invented edits, all requiring Korean explanations). Measured on Ollama `0.40.7`, `think=false`, `temperature=0.0`.
+Task file: `tasks/test_set_v4.1.jsonl` (104 erroneous Spanish sentences expecting a targeted fix, 104 already-correct sentences expecting confirmation without invented edits, all requiring Korean explanations). Everything below ran on Ollama `0.40.7` with `think=false` and `temperature=0.0`.
 
-### 1. The scorer caught a prompt effect before the judge even ran
+### Prompt format vs fine-tuning
 
-With the plain tutor prompt (`tutor_system.txt`), `gemma4-tutor-v4` beat stock `gemma4:e2b` by 62 points (168 vs 106). Switching to `prompts/tutor_system_rewrite_first.txt` raised stock to 170/208 and revealed that v4 had actually regressed on erroneous sentences (75 vs 84). That drove the v5 self-distillation run (`gemma4:26b` fallback on hard error items), which recovered errors to 90/104.
+With the plain tutor prompt, `gemma4-tutor-v4` beat stock `gemma4:e2b` by 62 points (168 vs 106). Switching to `prompts/tutor_system_rewrite_first.txt` moved the stock model to 170/208 and showed that `v4` had regressed on erroneous sentences (75 vs 84). That led to the `v5` self-distillation run using `gemma4:26b` fallback on hard error items, which recovered errors to 90/104.
 
 | Model | System prompt | Total | Errors (104) | Correct (104) | p50 |
 | --- | --- | --- | --- | --- | --- |
@@ -30,9 +32,9 @@ With the plain tutor prompt (`tutor_system.txt`), `gemma4-tutor-v4` beat stock `
 | `gemma4-tutor-v4` (`7da4a1bb1fa7`) | rewrite-first | 174/208 | 75 | 99 | 0.50s |
 | `gemma4-tutor-v5` (`b625e3338088`) | rewrite-first | 184/208 | 90 | 94 | 0.99s |
 
-### 2. Adding the `gemma4:26b` judge on the 104 rubric items
+### Local judge (gemma4:26b)
 
-Re-scoring the same rewrite-first answers with `--judge gemma4:26b --judge-think false` (digest `001e5dafc3c7`, blind to reference fixes, 0 parse errors across 312 calls):
+Re-scoring those rewrite-first answers with `--judge gemma4:26b --judge-think false` (digest `001e5dafc3c7`, blind to reference fixes, 0 parse errors across 312 calls):
 
 | Model | Pass | Rate | 95% CI | Errors (104) | Correct (104) | p50 | Disagreements |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -40,14 +42,14 @@ Re-scoring the same rewrite-first answers with `--judge gemma4:26b --judge-think
 | `gemma4-tutor-v4` | 166/208 | 79.8% | 73.8%-84.7% | 75/104 | 91/104 | 0.50s | 10 |
 | `gemma4-tutor-v5` | 181/208 | 87.0% | 81.8%-90.9% | 90/104 | 91/104 | 0.99s | 6 |
 
-### 3. Why the disagreements matter
+### Disagreement examples
 
-Running both string checks and the judge surfaces failures neither catches alone:
+Running both string checks and the local judge side-by-side catches errors neither sees alone:
 
 - `gemma4-tutor-v4` on `t4-ok-001` (`mech_pass_judge_fail`): the model opened with `**바뀐 곳:** 없음` and `네, 맞아요!` (passing `says_correct`), then told the learner to replace `visitar` with `ir` in the explanation. The judge failed it.
-- `gemma4-tutor-v5` on `t4-ok-040` (`mech_pass_judge_fail`): confirmed `"A mis amigos les gustaban los perros de la calle."` was grammatically right, then translated `perros` as `길고양이들` ("street cats"). The judge caught the mistranslation.
-- `gemma4-tutor-v5` on `t4-ok-054` (`mech_pass_judge_fail`): confirmed `"Te doy este mapa para que no te pierdas en el camping."` was right, then claimed `pierdas` is an infinitive (`원형`). The judge caught the wrong grammar rule.
-- `gemma4-tutor-v5` on `t4-ok-018` (`mech_fail_judge_pass`): answered `네, 어색하지 않아요!` ("Yes, it's not awkward!"). `says_correct` rejected it because `어색` is in its denial list; the judge passed it.
+- `gemma4-tutor-v5` on `t4-ok-040` (`mech_pass_judge_fail`): confirmed `"A mis amigos les gustaban los perros de la calle."` was grammatically right, then translated `perros` as `길고양이들` (street cats). The judge caught the mistranslation.
+- `gemma4-tutor-v5` on `t4-ok-054` (`mech_pass_judge_fail`): confirmed `"Te doy este mapa para que no te pierdas en el camping."` was right, then claimed `pierdas` is an infinitive (`원형`). The judge caught the wrong grammar term.
+- `gemma4-tutor-v5` on `t4-ok-018` (`mech_fail_judge_pass`): answered `네, 어색하지 않아요!` ("Yes, it's not awkward!"). `says_correct` failed it because `어색` sits in the denial word list, and the judge passed it.
 
 ## Quick start
 
@@ -93,9 +95,9 @@ Run the unit suite (`python3 tests.py`).
 
 ## Limits
 
-- Judge calibration is pending: `calibrate --interactive` is ready for a 30-item blind pass (15 disagreements, 7 both-pass, 8 both-fail from `results-v5-judged.json`), waiting on a Korean-speaker labeling pass to compute human-vs-judge Cohen's kappa.
-- Blind judge vs system prompt friction: on 12 `gemma4:e2b` items, the model followed the system prompt's `**다시 써 보면:**` header without emitting `**바뀐 곳:** 없음`, and `gemma4:26b` penalized the heading itself as an implied rewrite. Keeping mechanical checks and the judge visible side-by-side makes that bias obvious instead of hiding it.
-- Standalone Python against `/api/generate`: intentionally lives outside `cmd/bench` so any task file can be run without a Go build. A `-rubric` flag inside `cmd/bench` is the natural next step if maintainers want it upstream.
+- Judge calibration is pending: I do not speak Korean, so a Korean speaker still needs to run the 30-item blind pass (`calibrate --interactive`, 15 disagreements, 7 both-pass, 8 both-fail from `results-v5-judged.json`) to get human-vs-judge Cohen's kappa.
+- Blind judge vs system prompt friction: on 12 `gemma4:e2b` items, the model used the prompt's `**다시 써 보면:**` header without emitting `**바뀐 곳:** 없음`, and `gemma4:26b` treated the heading itself as a rewrite. Showing mechanical checks and judge verdicts side-by-side makes that visible.
+- Standalone Python over `/api/generate`: this sits outside `cmd/bench` so any JSONL task file runs without rebuilding Go. Adding `-rubric` inside `cmd/bench` would make sense if maintainers want it upstream.
 
 ## Layout
 
